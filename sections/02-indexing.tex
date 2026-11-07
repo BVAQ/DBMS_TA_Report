@@ -1,0 +1,36 @@
+\section{Indexing in MongoDB}
+\label{sec:indexing}
+
+\subsection{Theory from class}
+\todo{Ordered files, primary / clustering / secondary indexes, multilevel indexes, B$^+$-tree.}
+
+\subsection{Indexing in MongoDB (practice)}
+\todo{WiredTiger B-tree, \code{\_id} index, key $\rightarrow$ RecordId, clustered collections, compound / multikey / hashed / vector indexes.}
+
+\subsection{Demo and results}
+\subsubsection{Case 1: retrieve by patient ID}
+\todo{COLLSCAN vs IXSCAN, explain() metrics.}
+
+\begin{lstlisting}[language=mongosh,caption={Example: create an index and inspect the plan}]
+db.images.createIndex({ patient_id: 1 })
+db.images.find({ patient_id: "P001" }).explain("executionStats")
+\end{lstlisting}
+
+\subsubsection{Case 2: patient ID with conditions}
+\todo{Compound index, ESR rule, index prefix, covered query.}
+
+\subsubsection{Case 3: similar MRI images}
+\todo{Embeddings, vector search index, ANN vs exact.}
+
+\subsection{Theory vs. practice}
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Class (Chapter 2)} & \textbf{MongoDB} \\
+\midrule
+\todo{fill in} & \todo{fill in} \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison between theory and practice.}
+\end{table}

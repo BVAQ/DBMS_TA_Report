@@ -1,0 +1,9 @@
+{
+  "latex-workshop.latex.outDir": "%DIR%/build",
+  "latex-workshop.latex.autoBuild.run": "onSave",
+  "latex-workshop.view.pdf.viewer": "tab",
+  "latex-workshop.latex.recipe.default": "latexmk",
+  "latex-workshop.latex.clean.fileTypes": ["*.aux","*.bbl","*.blg","*.log","*.out","*.toc","*.fls","*.fdb_latexmk","*.synctex.gz"],
+  "files.eol": "\n",
+  "editor.wordWrap": "on"
+}

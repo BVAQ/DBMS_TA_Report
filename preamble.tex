@@ -1,0 +1,56 @@
+% ---------- Encoding & language ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T5,T1]{fontenc}   % T5 = Vietnamese diacritics, T1 = Latin
+\usepackage[english]{babel}   % add vietnamese if the report is in Vietnamese: [vietnamese,english]
+\usepackage{lmodern}
+
+% ---------- Layout ----------
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{parskip}
+
+% ---------- Math, tables, figures ----------
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx,array}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{float}
+\usepackage{caption,subcaption}
+
+% ---------- Code listings (mongosh / Python / JSON) ----------
+\usepackage{xcolor}
+\usepackage{listings}
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!50!black},
+  backgroundcolor=\color{gray!8},
+  frame=single, rulecolor=\color{gray!40},
+  breaklines=true, breakatwhitespace=false,
+  showstringspaces=false, numbers=left,
+  numberstyle=\tiny\color{gray}, xleftmargin=1.5em, framexleftmargin=1.5em,
+  columns=fullflexible, keepspaces=true
+}
+\lstset{style=code}
+\lstdefinelanguage{mongosh}{
+  morekeywords={db,find,findOne,aggregate,createIndex,explain,insertMany,insertOne,hint,getIndexes,dropIndex,sort,limit,const,let,var},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+  morestring=[b]'
+}
+
+% ---------- Diagrams ----------
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric}
+
+% ---------- Links (load late) ----------
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+
+% ---------- Handy macros ----------
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
