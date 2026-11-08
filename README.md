@@ -21,7 +21,7 @@ build.ps1           # PowerShell helper
 1. **LaTeX**: MiKTeX (`winget install MiKTeX.MiKTeX`) or TeX Live.
 2. **Perl** (MiKTeX only, needed by `latexmk`): `winget install StrawberryPerl.StrawberryPerl`
 3. **VS Code** + extension **LaTeX Workshop** (VS Code will suggest it).
-4. Restart the terminal, then check: `latexmk -v`
+4. Restart the terminal, then check: `
 
 MiKTeX installs missing packages on the fly; allow it when prompted
 (Settings -> "Install missing packages: Always").

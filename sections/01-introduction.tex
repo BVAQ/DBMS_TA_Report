@@ -1,4 +1,227 @@
 \section{Introduction}
 \label{sec:intro}
 
-\todo{Context, objectives, datasets (text and MRI image data), case studies, and how the report is organized.}
+This report documents the team assessment of the Database Management Systems (DBMS) course.
+Using MongoDB as the DBMS assigned by the lecturer and two public datasets, we study how a
+real system supports \emph{indexing}, \emph{query processing and optimization},
+\emph{transactions} and \emph{concurrency control}, and we systematically compare the theory
+taught in class with the technology used in practice.
+
+\subsection{Objectives and case studies}
+\label{sec:objectives}
+
+The assessment asks the team to show how the DBMS works on sample data for the following four
+topics, and to explain each one against the course theory.
+\begin{enumerate}
+  \item How the DBMS works with \textbf{indexing} (\Cref{sec:indexing}).
+  \item How the DBMS works with \textbf{query processing and optimization}
+        (\Cref{sec:query}).
+  \item How the DBMS works with \textbf{transactions} (\Cref{sec:transaction}).
+  \item How the DBMS works with \textbf{concurrency control} (\Cref{sec:concurrency}).
+\end{enumerate}
+All topics are demonstrated on one common application with three required case studies:
+\begin{enumerate}[label=\textbf{C\arabic*.}]
+  \item retrieve the text record and the images of a patient given a \emph{patient ID};
+  \item retrieve the text record and the images given a patient ID \emph{and conditions}
+        (for example, only T2 sagittal MRI images);
+  \item retrieve the MRI images that are \emph{similar} to one MRI image of a given patient.
+\end{enumerate}
+
+\subsection{Datasets}
+\label{sec:datasets}
+The application uses two public datasets from Mendeley Data: a text dataset with the patients'
+records and an image dataset with their MRI scans. \todo{Describe each dataset: number of
+patients and files, fields, image types and sizes, any cleaning or additional data we added, and
+the final schema loaded into MongoDB.}
+
+\subsection{Organization of the report}
+\label{sec:organization}
+\Cref{sec:mongodb-overview} gives an overview of MongoDB. \Cref{sec:indexing} to
+\Cref{sec:concurrency} treat the four topics; each of them is organized in the same way: the
+\emph{theory in class}, the \emph{implementation in MongoDB}, a \emph{demonstration} on the
+case studies, and a \emph{comparison} between theory and practice. \Cref{sec:conclusion}
+concludes and \Cref{sec:contrib} lists the contribution of each member.
+
+\subsection{MongoDB Overview}
+\label{sec:mongodb-overview}
+
+MongoDB is an open, general-purpose \emph{document-oriented} NoSQL database
+\cite{mongodb-intro}. Rather than spreading an entity over several fixed-schema tables that must
+be joined at query time, it stores each entity as one self-describing \emph{document}. This suits
+semi-structured data such as patient records, whose attributes vary from one patient to another,
+and it lets the database scale out over many machines.
+
+\subsubsection{Data model}
+A MongoDB deployment hosts \emph{databases}; a database holds \emph{collections}; a collection
+holds \emph{documents}. \Cref{tab:terms} maps relational terms to MongoDB terms.
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{0.85\textwidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Relational DBMS} & \textbf{MongoDB} \\
+\midrule
+Database & Database \\
+Table & Collection \\
+Row (tuple) & Document \\
+Column (attribute) & Field \\
+Primary key & \code{\_id} field \\
+Join & Embedded documents, \code{\$lookup} stage \\
+Schema fixed per table & Flexible per document (optional validation rules) \\
+\bottomrule
+\end{tabularx}
+\caption{Relational terminology versus MongoDB terminology.}
+\label{tab:terms}
+\end{table}
+
+\paragraph{Documents and BSON.}
+A document is an ordered set of field--value pairs. Internally and on the wire, documents are
+encoded in \emph{BSON}, a binary superset of JSON. BSON adds types that JSON lacks, such as
+\code{Int32}, \code{Int64}, \code{Double}, \code{Decimal128}, \code{Date}, \code{ObjectId} and
+\code{Binary}, and it is designed to be fast to traverse and to encode. A value can itself be a
+nested document or an array, so a hierarchy of related data can live in one document. A single
+document may not exceed 16~MB, which is why large binary objects such as images are normally kept
+outside the document (on disk, or in GridFS, which splits a file into chunks) while the document
+stores only metadata and a path.
+
+\paragraph{The \code{\_id} field.}
+Every document has a unique \code{\_id}, which acts as its primary key. If the client does not
+supply one, the driver generates a 12-byte \code{ObjectId} made of a 4-byte timestamp, a 5-byte
+random value and a 3-byte counter, so identifiers are practically unique and roughly increasing
+in time without any coordination between clients. MongoDB automatically builds a unique index on
+\code{\_id} for every collection.
+
+\paragraph{Flexible schema and schema validation.}
+By default, documents in the same collection may have different fields and field types. When
+stricter control is needed, a collection can carry a JSON Schema validator that rejects documents
+which do not conform. Flexibility makes it easy to evolve the data over time, but it moves part of
+the responsibility for data quality from the DBMS to the application.
+
+\paragraph{Embedding versus referencing.}
+Modeling in MongoDB is driven by the access pattern rather than by normalization.
+\Cref{tab:embed} contrasts the two basic designs. In our application, the case studies always
+start from a patient ID and then need the patient's text record together with images, so a
+patient and its image metadata are read together; at the same time, images are numerous and are
+also queried on their own (by series and orientation, and by similarity). \todo{State the final
+design chosen by the team: one collection per entity with references, or images embedded in
+the patient document.}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & \textbf{Embedding} & \textbf{Referencing} \\
+\midrule
+Idea & Nest related data inside one document & Keep related data in separate documents linked by an identifier (such as \code{patient\_id}) \\
+Reads & One read returns everything; no join & Needs a second query or \code{\$lookup} \\
+Writes & A document grows; atomic as one document & Each document is small; updates touch several documents \\
+Best when & Data is read together and its size is bounded & Data is large, unbounded, shared, or queried independently \\
+\bottomrule
+\end{tabularx}
+\caption{Embedding versus referencing in MongoDB data modeling.}
+\label{tab:embed}
+\end{table}
+
+\begin{lstlisting}[language=mongosh,caption={A patient document that embeds image metadata}]
+{
+  _id: ObjectId("..."),
+  patient_id: "P001",
+  age: 54,
+  report: "Mild disc bulge at L4-L5 ...",
+  images: [
+    { series: "T2", orientation: "sagittal", path: "img/P001_t2_sag_01.png" },
+    { series: "T1", orientation: "axial",    path: "img/P001_t1_ax_01.png" }
+  ]
+}
+\end{lstlisting}
+
+\subsubsection{Query interface}
+Applications talk to MongoDB through official drivers (for example PyMongo for Python) or the
+interactive shell \code{mongosh}. CRUD is expressed by methods such as \code{insertOne},
+\code{insertMany}, \code{find}, \code{updateOne} and \code{deleteOne}. A query is itself a
+document: field conditions are combined by default with AND, and operators such as \code{\$eq},
+\code{\$gt}, \code{\$in}, \code{\$and} and \code{\$or} build richer conditions. Projection chooses
+the returned fields, and \code{sort} and \code{limit} shape the result. Complex analysis uses the
+\emph{aggregation pipeline}, a sequence of stages (\code{\$match}, \code{\$group},
+\code{\$sort}, \code{\$lookup}, \code{\$project}, \dots) where each stage transforms the stream of
+documents produced by the previous one. The three case studies map to queries of the following
+form.
+
+\begin{lstlisting}[language=mongosh,caption={Query forms of the three case studies (sketch)}]
+// C1: by patient ID
+db.images.find({ patient_id: "P001" })
+
+// C2: by patient ID and conditions
+db.images.find({ patient_id: "P001", series: "T2", orientation: "sagittal" })
+
+// C3: similar images (vector search stage)
+db.images.aggregate([
+  { $vectorSearch: { index: "image_vec_idx", path: "embedding",
+                     queryVector: queryEmbedding, numCandidates: 200, limit: 5 } }
+])
+\end{lstlisting}
+
+\subsubsection{Architecture}
+\label{sec:mongodb-arch}
+The database server process is \code{mongod}. It receives requests from clients, executes them
+through the query engine, and delegates storage to a pluggable \emph{storage engine}.
+
+\paragraph{Storage engine: WiredTiger.}
+The default storage engine is WiredTiger \cite{mongodb-storage}. It keeps collections and indexes
+in B-tree-based structures on disk and caches the working set in memory (by default about half of
+the RAM minus 1~GB). It provides \emph{document-level concurrency control}: concurrent writers lock
+individual documents rather than whole collections, and readers see a consistent snapshot of the
+data (multiversion concurrency control). Durability is obtained by combining a write-ahead
+\emph{journal} with periodic \emph{checkpoints} of the data files (every 60 seconds by default).
+Data is compressed on disk (Snappy by default for collections) and index keys use prefix
+compression, which reduces I/O and storage.
+
+\paragraph{Replication.}
+A \emph{replica set} is a group of \code{mongod} instances holding the same data. One member is the
+\emph{primary} and receives all writes; the \emph{secondaries} replicate the primary's operation log
+(\emph{oplog}) and apply it. If the primary becomes unavailable, the remaining members hold an
+election and promote a secondary automatically, giving redundancy and high availability
+\cite{mongodb-replication}. Write concern and read concern let the application choose how many
+members must acknowledge a write and how up to date a read must be.
+
+\paragraph{Sharding.}
+To scale beyond one machine, a collection can be partitioned horizontally into \emph{chunks} spread
+over several \emph{shards} (each usually a replica set) according to a \emph{shard key}. A router
+process (\code{mongos}) directs each operation to the relevant shards using metadata kept by the
+config servers. The choice between a ranged and a hashed shard key trades efficient range queries
+against an even distribution of data.
+
+\paragraph{Transactions.}
+Every write to a single document, including its nested fields and arrays, is atomic. For
+operations spanning several documents, MongoDB supports multi-document ACID transactions on
+replica sets (since version~4.0) and on sharded clusters (since version~4.2), using snapshot
+isolation. Transactions are treated in \Cref{sec:transaction}.
+
+\paragraph{Indexes.}
+MongoDB supports single-field, compound, multikey, hashed, text, geospatial, wildcard, TTL and
+partial indexes, among others, which are examined in \Cref{sec:indexing}.
+
+\paragraph{Search and vector search.}
+Full-text search and vector search are provided by a separate process, \code{mongot}, that is
+deployed beside \code{mongod} and keeps its own search indexes synchronized with the data. They
+became generally available for the self-managed Community Edition with MongoDB~8.2 or later
+\cite{mongodb-search-ga}. Vector search is the basis of our similar-image retrieval (case study
+C3).
+
+\subsubsection{Editions and deployment}
+MongoDB is offered as the Community Edition (free, source-available), the commercial Enterprise
+edition for self-managed use, and the cloud service Atlas. This report uses the self-managed
+Community Edition. \todo{Give the exact MongoDB version, the operating system, how it was installed
+(for example with Docker), and the hardware used for the experiments.}
+
+\subsubsection{Strengths and limitations}
+\begin{description}
+  \item[Strengths.] A flexible schema suited to evolving, semi-structured data; a data model
+        close to application objects; rich indexing; built-in replication and horizontal scaling;
+        integrated search and vector search.
+  \item[Limitations.] Joins across collections are less efficient than in relational systems;
+        denormalized (embedded) data may be duplicated and must be kept consistent by the
+        application; documents are limited to 16~MB; the working set should fit in memory for the
+        best performance.
+\end{description}

@@ -1,13 +1,394 @@
 \section{Indexing in MongoDB}
 \label{sec:indexing}
 
-\subsection{Theory from class}
-\todo{Ordered files, primary / clustering / secondary indexes, multilevel indexes, B$^+$-tree.}
+\subsection{Theory (in class)}
+\label{sec:index-theory}
+
+This subsection summarizes the file-organization and indexing theory of the course
+(Chapter~2, based on \cite{elmasri2016,dbms-ch2}). It starts from how records are stored on disk,
+reviews the basic file organizations, and then builds up from single-level indexes to multilevel
+indexes and B$^+$-trees. It is the reference point for the comparison with MongoDB in
+\Cref{sec:index-compare}.
+
+\subsubsection{Records, blocks and the cost model}
+A \emph{file} is a sequence of \emph{records}, and each record is a collection of field values.
+Records may have fixed or variable length. Records are stored in disk \emph{blocks}, and the
+block is the unit of transfer between disk and memory. Storing several records in one block is
+called \emph{blocking}, and the \emph{blocking factor} is the number of records per block:
+\[
+bfr = \left\lfloor \frac{B}{R} \right\rfloor, \qquad
+b = \left\lceil \frac{r}{bfr} \right\rceil ,
+\]
+where $B$ is the block size, $R$ the record size, $r$ the number of records and $b$ the number
+of blocks of the file. Records may be \emph{unspanned} (a record never crosses a block boundary,
+usual for fixed-length records) or \emph{spanned} (a record may continue in the next block, usual
+for variable-length records). Because reading a block from disk is far more expensive than
+processing it in memory, the cost of an operation is measured by the \textbf{number of block
+accesses}. The typical file operations are \textsc{open}, \textsc{find}, \textsc{findnext},
+\textsc{read}, \textsc{insert}, \textsc{delete}, \textsc{modify}, \textsc{close},
+\textsc{reorganize} and \textsc{read\_ordered}.
+
+\subsubsection{Basic file organizations}
+\label{sec:file-org}
+\begin{description}
+  \item[Unordered (heap) file.] New records are appended at the end of the file, so insertion is
+        very efficient. Searching requires a \emph{linear search}, which reads half of the blocks
+        on average ($b/2$), and reading the records in the order of a field requires sorting.
+  \item[Ordered (sequential) file.] Records are kept sorted by an \emph{ordering field}. A
+        \emph{binary search} on the ordering field needs about $\lceil\log_2 b\rceil$ block
+        accesses, and reading records in order is efficient. Insertion is expensive because the
+        record must be placed in the right position; a separate unordered \emph{overflow} file is
+        often used for new records and merged periodically into the main file.
+  \item[Hashed file (external hashing).] The blocks are divided into $M$ buckets, and a record
+        with hash-key value $K$ is stored in bucket $h(K)$. Search on the hash key is very
+        efficient (about one block access). A \emph{collision} happens when a bucket is full;
+        it is resolved by open addressing, chaining with an overflow area, or multiple hashing.
+        A hash file is typically kept 70--80\% full and needs a hash function that spreads
+        records uniformly. Its drawbacks are the fixed number of buckets $M$ when the file grows
+        or shrinks, and the inefficiency of ordered access on the hash key.
+\end{description}
+\Cref{tab:file-org} summarizes the average cost of finding one record. Only the ordering
+(or hash) field benefits from the organization: a search on any other field still scans the file.
+Indexes were introduced to give efficient access paths on those other fields as well.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Organization} & \textbf{Search on the organizing field} & \textbf{Insertion} \\
+\midrule
+Unordered (heap) & Linear: $\approx b/2$ block accesses & Cheap: append to the end \\
+Ordered & Binary search: $\lceil\log_2 b\rceil$ & Expensive: keep the order (or use an overflow file) \\
+Hashed & About 1 (without overflow) & Cheap, but overflow may occur \\
+\bottomrule
+\end{tabularx}
+\caption{Average cost of accessing a record under the three file organizations.}
+\label{tab:file-org}
+\end{table}
+
+\subsubsection{Indexes as access paths}
+A \emph{single-level index} is an auxiliary file that makes it more efficient to find records in
+the data file. It is usually specified on one field of the file (the \emph{indexing field}) and
+is a file of entries $\langle K(i), P(i)\rangle$, \emph{ordered} by the field value $K(i)$, where
+$P(i)$ is a pointer to a block or to a record. The index is called an \emph{access path} on that
+field. Because an index entry holds only the key and a pointer, it is much smaller than a data
+record, so the index file occupies considerably fewer blocks than the data file. A binary search
+on the (ordered) index file therefore touches few blocks and yields a pointer to the record, after
+which one more block access fetches the data.
+
+Indexes are further characterized as \emph{dense} or \emph{sparse}. A \textbf{dense} index has an
+entry for every search-key value (hence for every record) of the data file. A \textbf{sparse}
+(non-dense) index has entries for only some of the search values. A sparse index is smaller, but it
+requires the data file to be ordered on the indexing field so that the record can be located from
+the nearest preceding entry.
+
+\subsubsection{Types of single-level ordered indexes}
+\label{sec:single-level}
+\paragraph{Primary index.}
+A primary index is defined on a data file that is \emph{ordered on a key field}. It has one entry
+per \emph{block} of the data file, made of the key of the first record of the block (the
+\emph{block anchor}) and a pointer to that block. The number of entries therefore equals the
+number of data blocks, and the index is sparse. To find a record with key $K$, binary-search the
+index for the last entry whose anchor is $\le K$, then read that data block and search inside it.
+
+\paragraph{Clustering index.}
+A clustering index is defined on a data file that is \emph{ordered on a non-key field}, so that
+records with the same value are stored together (clustered). It has one entry per \emph{distinct
+value} of the field, pointing to the first block that contains records with that value. The index
+is sparse. A file has at most one physical ordering, hence it can have at most one primary index
+\emph{or} one clustering index, but not both.
+
+\paragraph{Secondary index.}
+A secondary index provides an additional access path on a field by which the data file is
+\emph{not} ordered. The indexing field may be a \emph{key} (unique values) or a \emph{non-key}
+(duplicate values), and a file can have many secondary indexes.
+\begin{itemize}
+  \item On a key field, the index is \emph{dense}: one entry per record, because records cannot
+        be located from neighboring entries when the file is unordered on that field.
+  \item On a non-key field, there are three options: (1) a duplicate entry for each record, (2)
+        a variable-length list of pointers $\langle P(i,1),\dots,P(i,k)\rangle$ inside the entry,
+        or (3) one entry per distinct value together with an extra level of indirection (blocks
+        of record pointers). Option~3 is the most commonly used.
+\end{itemize}
+
+\Cref{tab:single-level} compares the three types.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & \textbf{Primary} & \textbf{Clustering} & \textbf{Secondary} \\
+\midrule
+Data file ordered on indexing field & Yes & Yes & No \\
+Indexing field is a key & Yes & No & Key or non-key \\
+Number of index entries & One per data block & One per distinct value & One per record (key), or one per distinct value (non-key, option 3) \\
+Dense / sparse & Sparse & Sparse & Dense (key); dense or sparse (non-key) \\
+How many per file & At most one primary \emph{or} one clustering & (see left) & Many \\
+\bottomrule
+\end{tabularx}
+\caption{Single-level ordered indexes.}
+\label{tab:single-level}
+\end{table}
+
+\subsubsection{Cost of searching: worked examples}
+\label{sec:index-examples}
+Consider a file with $r = 300{,}000$ fixed-size, unspanned records of $R = 100$ bytes on a disk
+with block size $B = 4{,}096$ bytes. Then
+\[
+bfr = \left\lfloor \frac{4096}{100} \right\rfloor = 40, \qquad
+b = \left\lceil \frac{300000}{40} \right\rceil = 7{,}500 .
+\]
+
+\paragraph{Without an index.} On the ordered file, a binary search needs
+$\lceil \log_2 7500 \rceil = 13$ block accesses. On an unordered file, a linear search needs on
+average $b/2 = 3{,}750$ accesses.
+
+\paragraph{Primary index.} Let the ordering key have $V = 9$ bytes and block pointers $P = 6$
+bytes. An index entry has $R_i = 9 + 6 = 15$ bytes, so
+$bfr_i = \lfloor 4096/15 \rfloor = 273$ entries per block. The index has $r_i = 7{,}500$ entries
+(one per data block) and occupies $b_i = \lceil 7500/273 \rceil = 28$ blocks. A binary search on the
+index costs $\lceil \log_2 28 \rceil = 5$ accesses, plus 1 access for the data block:
+\textbf{6 block accesses} in total, against 13.
+
+\paragraph{Clustering index.} Suppose the same file is ordered on \code{Zipcode} with 1{,}000
+distinct values, and an entry has $5 + 6 = 11$ bytes. Then $bfr_i = \lfloor 4096/11 \rfloor = 372$,
+$r_i = 1{,}000$ and $b_i = \lceil 1000/372 \rceil = 3$ blocks, so a binary search on the index needs
+$\lceil \log_2 3 \rceil = 2$ accesses before reading the blocks that hold the records of that
+zip code.
+
+\paragraph{Secondary index on a key field.} For a non-ordering key field of the same file, the
+index is dense: $r_i = 300{,}000$ entries, $b_i = \lceil 300000/273 \rceil = 1{,}099$ blocks. A
+binary search costs $\lceil \log_2 1099 \rceil = 11$ accesses, plus 1 for the record:
+\textbf{12 block accesses}, against $3{,}750$ for a linear search.
+
+\subsubsection{Multilevel indexes}
+\label{sec:multilevel}
+Since a single-level index is itself an ordered file, we can create a primary index \emph{on the
+index}: the original index is the \emph{first level} and the new index is the \emph{second level}.
+The process is repeated, creating a third, fourth, \dots\ level, until all entries of the top level
+fit in one block. A multilevel index can be built on any first-level index (primary, clustering or
+secondary) provided it spans more than one block. The number of blocks at each level is
+\[
+b_1 = \left\lceil \frac{r_1}{bfr_i} \right\rceil, \quad
+b_{j} = \left\lceil \frac{b_{j-1}}{bfr_i} \right\rceil, \quad
+\text{stop at the top level } t \text{ where } b_t = 1,
+\]
+and a search reads one block per level plus the data block: $t + 1$ accesses. The factor $bfr_i$ is
+the \emph{fan-out}, which is why large fan-out keeps the number of levels small. A two-level
+primary index resembles the \emph{ISAM} (Indexed Sequential Access Method) organization.
+
+For the secondary index of the example: $b_1 = 1{,}099$, $b_2 = \lceil 1099/273 \rceil = 5$ and
+$b_3 = \lceil 5/273 \rceil = 1$, so $t = 3$ and a search costs $t + 1 = 4$ block accesses, instead
+of 12 with binary search on the single-level index.
+
+A multilevel index is a form of \emph{search tree}. Its weakness is maintenance: every level is
+an ordered file, so inserting or deleting an entry may require shifting entries at several levels.
+This is the ``severe problem'' that dynamic structures solve.
+
+\subsubsection{B-trees and B$^+$-trees}
+\label{sec:btree}
+Most multilevel indexes use B-trees or B$^+$-trees because of the insertion and deletion problem.
+They are search trees in which each node corresponds to a disk block and is kept between half full
+and completely full, which leaves free space for new entries without reorganizing the whole index.
+
+\paragraph{B-tree versus B$^+$-tree.}
+In a B-tree, pointers to data records appear at \emph{all} levels of the tree. In a B$^+$-tree,
+pointers to data records appear \emph{only in the leaf nodes}; internal nodes contain only search
+values and tree pointers, and the leaf nodes are linked together in key order. Consequently an
+internal B$^+$-tree node can hold more entries, so a B$^+$-tree can have fewer levels (a higher
+capacity) than the corresponding B-tree, and ordered or range access is efficient by following the
+leaf links. These properties explain why the B$^+$-tree is the standard index structure of
+commercial DBMSs.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & \textbf{B-tree} & \textbf{B$^+$-tree} \\
+\midrule
+Data pointers & In nodes at all levels & Only in leaf nodes \\
+Internal nodes & Keys, data pointers and tree pointers & Keys and tree pointers only \\
+Leaf nodes & Same structure as internal nodes & Key and data-pointer pairs, plus a pointer to the next leaf \\
+Fan-out and height & Lower fan-out, possibly more levels & Higher fan-out, fewer levels \\
+Range / ordered scan & Requires traversing the tree & Follow the linked leaves \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of B-trees and B$^+$-trees.}
+\label{tab:btree-vs-bplus}
+\end{table}
+
+\paragraph{Structure of a B$^+$-tree node.}
+Let $p$ be the order of an \emph{internal} node: it has up to $p$ tree pointers and up to $p-1$
+search values $K_1 < K_2 < \dots$, with the subtree at the $i$-th pointer holding values $\le K_i$
+(and greater than $K_{i-1}$). A \emph{leaf} node holds up to $p_{leaf}$ pairs
+$\langle K, P_r\rangle$ with record pointers, followed by a pointer to the next leaf. Every node
+except the root is at least half full, and all leaves are at the same level, so the tree is always
+\emph{balanced} and every search visits the same number of nodes.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  nd/.style={draw, rounded corners=1pt, minimum height=7mm, inner sep=5pt, font=\small\ttfamily},
+  >=Stealth]
+  \node[nd, fill=blue!8]  (root) at (0,0) {9 \quad 17};
+  \node[nd, fill=green!8] (l1) at (-4,-2) {1 \quad 5 \quad 7};
+  \node[nd, fill=green!8] (l2) at (0,-2)  {9 \quad 12 \quad 15};
+  \node[nd, fill=green!8] (l3) at (4,-2)  {17 \quad 20 \quad 25};
+  \draw[->] ([xshift=-4mm]root.south) -- (l1.north);
+  \draw[->] (root.south) -- (l2.north);
+  \draw[->] ([xshift=4mm]root.south) -- (l3.north);
+  \draw[->, dashed] (l1.east) -- (l2.west);
+  \draw[->, dashed] (l2.east) -- (l3.west);
+  \foreach \n in {l1,l2,l3}
+    \draw[->, thick] (\n.south) -- ++(0,-0.6) node[below, font=\scriptsize] {data records};
+\end{tikzpicture}
+\caption{A small B$^+$-tree: an internal node (blue) and linked leaf nodes (green, dashed arrows) with pointers to the data records.}
+\label{fig:bplus}
+\end{figure}
+
+\paragraph{Order and capacity.}
+Each node must fit in one block. With $B = 512$ bytes, key size $V = 9$, block pointer $P = 6$ and
+record pointer $P_r = 7$, an internal node needs $p\cdot P + (p-1)\cdot V \le B$, i.e.\
+$15p \le 521$, so $p = 34$. A leaf needs $p_{leaf}\,(P_r + V) + P \le B$, i.e.\ $16\,p_{leaf} \le 506$,
+so $p_{leaf} = 31$. Assuming nodes are on average 69\% full, an internal node has about
+$34 \times 0.69 \approx 23$ pointers (22 keys) and a leaf about $31 \times 0.69 \approx 21$ record
+pointers. \Cref{tab:capacity} shows how the number of entries grows level by level.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Level} & \textbf{Nodes} & \textbf{Index entries} & \textbf{Pointers} \\
+\midrule
+Root & 1 & 22 & 23 \\
+Level 1 & 23 & $23\times 22 = 506$ & $23^2 = 529$ \\
+Level 2 & 529 & $529\times 22 = 11{,}638$ & $23^3 = 12{,}167$ \\
+Leaf level & 12,167 & $12{,}167\times 21 = 255{,}507$ & -- \\
+\bottomrule
+\end{tabular}
+\caption{Average capacity of a three-level B$^+$-tree (nodes 69\% full).}
+\label{tab:capacity}
+\end{table}
+
+A three-level B$^+$-tree thus indexes about 255{,}507 records, compared with 65{,}535 entries for
+the corresponding B-tree, and a search costs only the number of levels plus one data-block access.
+
+\paragraph{Insertion.}
+The new entry is inserted in the proper leaf. If the leaf has room, nothing else changes. If the
+leaf is full it \emph{overflows} and is split: a new leaf is created, the first
+$j = \lceil (p_{leaf}+1)/2 \rceil$ entries stay in the original leaf, the remaining entries move to
+the new leaf, the $j$-th search value is \emph{replicated} in the parent, and the parent receives an
+extra pointer to the new leaf. If the parent overflows too, it is split: the $j$-th value
+$(j = \lfloor (p+1)/2 \rfloor)$ is \emph{moved} up to the grandparent, the first $j-1$ entries stay,
+and the remaining entries go to a new internal node. The splitting may propagate up to the root; if
+the root splits, a new root is created and the tree grows by one level. A B$^+$-tree therefore grows
+from the top and stays balanced.
+
+\paragraph{Example of insertion.}
+Take $p = 3$ and $p_{leaf} = 2$ and insert the keys 8, 5, 1, 7, 3, 12, 9, 6 into an empty tree.
+\Cref{tab:insert-trace} traces the evolution and \Cref{fig:bplus-final} shows the final tree.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}rX@{}}
+\toprule
+\textbf{Insert} & \textbf{Effect} \\
+\midrule
+8, 5 & Single leaf $[5,8]$ (the root is the leaf). \\
+1 & Leaf overflows $[1,5,8]$: split into $[1,5]$ and $[8]$; $5$ is copied up, creating the root $[5]$. \\
+7 & Goes to the right leaf: $[7,8]$. \\
+3 & Left leaf overflows $[1,3,5]$: split into $[1,3]$ and $[5]$; $3$ is copied up, root becomes $[3,5]$. \\
+12 & Right leaf overflows $[7,8,12]$: split into $[7,8]$ and $[12]$; $8$ is copied up and the root overflows $[3,5,8]$: $5$ moves up as the new root, $[3]$ and $[8]$ become internal nodes (tree height increases). \\
+9 & Goes to the leaf $[12]$, giving $[9,12]$. \\
+6 & Leaf $[7,8]$ overflows $[6,7,8]$: split into $[6,7]$ and $[8]$; $7$ is copied up, the internal node becomes $[7,8]$. \\
+\bottomrule
+\end{tabularx}
+\caption{Insertion of 8, 5, 1, 7, 3, 12, 9, 6 with $p = 3$ and $p_{leaf} = 2$.}
+\label{tab:insert-trace}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  nd/.style={draw, rounded corners=1pt, minimum height=7mm, inner sep=5pt, font=\small\ttfamily},
+  >=Stealth, level distance=16mm]
+  \node[nd, fill=blue!8] (r) at (0,0) {5};
+  \node[nd, fill=blue!8] (a) at (-3.2,-1.6) {3};
+  \node[nd, fill=blue!8] (b) at (3.2,-1.6) {7 \quad 8};
+  \node[nd, fill=green!8] (l1) at (-4.6,-3.4) {1 \quad 3};
+  \node[nd, fill=green!8] (l2) at (-1.8,-3.4) {5};
+  \node[nd, fill=green!8] (l3) at (1.4,-3.4) {6 \quad 7};
+  \node[nd, fill=green!8] (l4) at (3.4,-3.4) {8};
+  \node[nd, fill=green!8] (l5) at (5.4,-3.4) {9 \quad 12};
+  \draw[->] (r.south) -- (a.north);
+  \draw[->] (r.south) -- (b.north);
+  \draw[->] ([xshift=-2mm]a.south) -- (l1.north);
+  \draw[->] ([xshift=2mm]a.south) -- (l2.north);
+  \draw[->] ([xshift=-4mm]b.south) -- (l3.north);
+  \draw[->] (b.south) -- (l4.north);
+  \draw[->] ([xshift=4mm]b.south) -- (l5.north);
+  \foreach \x/\y in {l1/l2,l2/l3,l3/l4,l4/l5} \draw[->, dashed] (\x.east) -- (\y.west);
+\end{tikzpicture}
+\caption{The B$^+$-tree after inserting 8, 5, 1, 7, 3, 12, 9, 6 ($p=3$, $p_{leaf}=2$); the leaves are linked in key order.}
+\label{fig:bplus-final}
+\end{figure}
+
+\paragraph{Deletion.}
+The entry is removed from the leaf; if the value also occurs in an internal node, the value to its
+left in the leaf replaces it there. If the leaf then has fewer entries than the minimum
+(\emph{underflow}), the DBMS first tries to \emph{redistribute} entries with a sibling leaf
+(commonly the left sibling first, then the right). If redistribution is impossible, the leaf is
+\emph{merged} with a sibling and the entry that pointed to the pair is deleted from the parent. An
+internal node that underflows is handled in the same way, using the separating entry of the parent;
+if the root becomes empty, the merged node becomes the new root. Merges can propagate up to the
+root and reduce the number of levels.
+
+\paragraph{Search.}
+A point query follows one root-to-leaf path comparing the key with the node values, so it reads
+as many blocks as there are levels plus one data block. A range query finds the first qualifying
+leaf this way and then follows the leaf links, without returning to the upper levels.
+
+\subsubsection{Index types in a commercial DBMS (Oracle, from class)}
+The course also surveys the index types offered by Oracle, which serve as an example of
+product technology.
+\begin{itemize}
+  \item \textbf{B-tree indexes} are the standard type; variants include index-organized tables
+        (the data is itself the index), \emph{reverse-key} indexes (the bytes of the key are
+        reversed to spread inserts over many blocks), \emph{descending} indexes and B-tree
+        \emph{cluster} indexes.
+  \item \textbf{Bitmap and bitmap join indexes} use a bitmap per value to point to many rows, and
+        combine conditions with fast bit operations.
+  \item \textbf{Function-based indexes} index a transformed column or an expression, for example
+        \code{UPPER(name)}.
+  \item \textbf{Application-domain indexes} are customized for a specific application.
+\end{itemize}
+Indexes are created with \code{CREATE [UNIQUE|BITMAP] INDEX \dots\ ON table(columns)}.
+
+\subsubsection{Key points used in the comparison}
+\begin{enumerate}
+  \item An index is an ordered access path of $\langle K, P\rangle$ entries: it speeds up reads at
+        the price of extra storage and slower inserts, deletes and updates.
+  \item Primary and clustering indexes are sparse and require the data file to be physically
+        ordered (hence only one of them per file), whereas secondary indexes are dense and can be
+        created on any field, in any number.
+  \item Multilevel indexes reduce the search cost to $t+1$ block accesses, where $t$ is logarithmic
+        in the number of entries with the fan-out as the base.
+  \item B$^+$-trees keep the index balanced under insertions and deletions by splitting and merging
+        nodes, store data pointers in linked leaves, and are the structure used in practice.
+\end{enumerate}
 
 \subsection{Indexing in MongoDB (practice)}
+\label{sec:index-practice}
 \todo{WiredTiger B-tree, \code{\_id} index, key $\rightarrow$ RecordId, clustered collections, compound / multikey / hashed / vector indexes.}
 
 \subsection{Demo and results}
+\label{sec:index-demo}
+
 \subsubsection{Case 1: retrieve by patient ID}
 \todo{COLLSCAN vs IXSCAN, explain() metrics.}
 
@@ -23,6 +404,7 @@ db.images.find({ patient_id: "P001" }).explain("executionStats")
 \todo{Embeddings, vector search index, ANN vs exact.}
 
 \subsection{Theory vs. practice}
+\label{sec:index-compare}
 \begin{table}[H]
 \centering
 \begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
