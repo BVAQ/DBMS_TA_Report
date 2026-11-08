@@ -384,35 +384,402 @@ Indexes are created with \code{CREATE [UNIQUE|BITMAP] INDEX \dots\ ON table(colu
 
 \subsection{Indexing in MongoDB (practice)}
 \label{sec:index-practice}
-\todo{WiredTiger B-tree, \code{\_id} index, key $\rightarrow$ RecordId, clustered collections, compound / multikey / hashed / vector indexes.}
+
+\subsubsection{How collections and indexes are stored}
+\label{sec:index-storage}
+MongoDB delegates storage to WiredTiger (\Cref{sec:mongodb-arch}). Every collection and every index
+is a separate WiredTiger table, and every table is a B-tree whose root and internal pages store only
+keys and references to child pages, while the leaf pages store the key--value pairs
+\cite{wt-btree}. Two tables cooperate to answer an indexed query (\Cref{fig:idx-storage}):
+\begin{itemize}
+  \item the \textbf{collection table} is keyed by an internal \emph{RecordId} and stores the BSON
+        document as the value \cite{pachot-recordid};
+  \item an \textbf{index table} stores, as its key, the indexed field values followed by the
+        RecordId of the document \cite{mongodb-dev-keystring}.
+\end{itemize}
+A lookup therefore descends the index B-tree (\code{IXSCAN}), obtains RecordIds, and then reads each
+document from the collection B-tree (\code{FETCH}). Even the automatic unique index on \code{\_id}
+works this way: the documents of an ordinary collection are \emph{not} stored in \code{\_id} order,
+so the \code{\_id} index is a dense secondary index, and a query on \code{\_id} needs one read in the
+index and one in the collection \cite{mongodb-clustered}.
+
+The structure differs from the textbook B$^+$-tree (\Cref{sec:btree}) in three practical points.
+First, WiredTiger never overwrites a page in place: a modified page is written to a new location,
+so leaf pages are \emph{not} chained by next-leaf pointers; an ordered scan moves to the next leaf
+through the parent page, which the cache keeps in memory while a child is in use
+\cite{wt-users-bplus}. Second, index keys are stored with \emph{prefix compression}, which removes
+the common prefix shared by consecutive keys, and collections use block compression (Snappy by
+default) \cite{mongodb-wiredtiger}. Third, the page size is large: in our deployment the indexes are
+created with internal and leaf pages of at most 16~KB (read from the \code{creationString} in the
+index statistics), against the 512-byte to 4~KB blocks of the examples in class.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  tb/.style={draw, rounded corners=2pt, align=center, font=\small, inner sep=4pt, minimum height=8mm},
+  >=Stealth, node distance=4mm]
+  \node[tb, fill=blue!8, text width=4.3cm] (ix) {\textbf{index table} \code{pid\_1}\\
+    \code{("0001", rid 17)}\\ \code{("0001", rid 18)} \dots};
+  \node[tb, fill=green!8, text width=4.3cm, right=1.6cm of ix] (col) {\textbf{collection table} \code{images}\\
+    \code{rid 17} $\rightarrow$ \{\,\_id, patient\_id, \dots\}\\ \code{rid 18} $\rightarrow$ \{\,\dots\}};
+  \draw[->, thick] (ix) -- node[above, font=\scriptsize]{RecordId} (col);
+  \node[font=\scriptsize, below=1mm of ix] {\code{IXSCAN}: B-tree on (key, RecordId)};
+  \node[font=\scriptsize, below=1mm of col] {\code{FETCH}: B-tree on RecordId};
+  \path (ix.south) -- (col.south) coordinate[pos=0.5] (mid);
+  \node[tb, fill=orange!10, text width=10.7cm, below=1.1cm of mid] (cl)
+    {\textbf{clustered collection}: one table keyed by \code{\_id} that holds the documents;
+     no separate \code{\_id} index (\code{CLUSTERED\_IXSCAN} = bounded scan of this table)};
+\end{tikzpicture}
+\caption{Index and collection storage in WiredTiger. Every index, including \code{\_id}, maps keys
+to RecordIds; only a clustered collection stores the documents themselves in key order.}
+\label{fig:idx-storage}
+\end{figure}
+
+\paragraph{Clustered collections.}
+Since version 5.3 a collection can be created with a \emph{clustered index} on \code{\_id}. Its
+documents are stored in one WiredTiger file ordered by \code{\_id}, no separate \code{\_id} index
+exists, and a query on \code{\_id} becomes a bounded scan of the collection \cite{mongodb-clustered}.
+This is the MongoDB counterpart of a primary index on an ordered file, or of an index-organized
+table in Oracle. The clustered key must be \code{\_id}, and it can only be chosen when the collection
+is created.
+
+\subsubsection{Index types and their counterparts in class}
+\label{sec:index-types}
+\Cref{tab:idx-types} lists the index types used in this report. All of them except the vector index
+are WiredTiger B-trees maintained by \code{mongod}; the vector index is maintained by the separate
+\code{mongot} process.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{4.0cm}@{}}
+\toprule
+\textbf{MongoDB index} & \textbf{Behavior} & \textbf{Closest concept in class} \\
+\midrule
+\code{\_id} (automatic) & Unique, one entry per document; documents are not ordered by \code{\_id} & Dense secondary index on a key field \\
+Single field, compound & Keys sorted by the fields in the declared order; usable on any prefix of the fields \cite{mongodb-compound} & Secondary index; index on multiple keys \\
+Multikey & Created automatically on an array field; one entry for each distinct element \cite{mongodb-multikey} & Secondary index on a non-key field \\
+Sparse, partial & Index only documents that contain the field (sparse) or match a filter (partial) \cite{mongodb-sparse,mongodb-partial} & No direct equivalent (see \Cref{sec:idx-other}) \\
+Hashed & Stores a hash of the value \cite{mongodb-hashed}; usable for equality, not for ranges (\Cref{sec:idx-other}) & Hashing \\
+Text & One entry per distinct stemmed word of each document \cite{mongodb-text} & Application-domain index \\
+Clustered collection & Documents stored in \code{\_id} order, no separate \code{\_id} index \cite{mongodb-clustered} & Primary index; index-organized table \\
+Vector (\code{mongot}) & Approximate nearest neighbors with HNSW, or exact search \cite{mongodb-vector} & Application-domain index (outside the B-tree family) \\
+\bottomrule
+\end{tabularx}
+\caption{Index types used in this report.}
+\label{tab:idx-types}
+\end{table}
+
+\paragraph{Reading an execution plan.}
+The \code{explain} command returns the chosen plan as a tree of stages and the work it did
+\cite{mongodb-explain}: \code{COLLSCAN} (full collection scan), \code{IXSCAN} (index scan within
+\emph{index bounds}), \code{FETCH} (read documents by RecordId), \code{SORT} (in-memory sort, absent
+when the index delivers the order), \code{PROJECTION\_COVERED} (result built from the index alone)
+and, since MongoDB~8.0, \code{EXPRESS\_IXSCAN}, a fast path for simple equality lookups. Its counters
+\code{totalKeysExamined} and \code{totalDocsExamined} are the practical analogue of the block
+accesses of \Cref{sec:index-examples}: they count index entries and documents, not disk blocks, and
+most pages are already cached, so they measure the logical work of a plan rather than its I/O.
+
+\subsection{Experimental setup}
+\label{sec:index-setup}
+\begin{itemize}
+  \item \textbf{System.} MongoDB~8.0.34 (WiredTiger) with \code{mongot}, run as a single-node replica
+        set from the official Docker image \code{mongodb-atlas-local:8.0} on an Apple-silicon
+        MacBook Pro; client PyMongo~4.19.
+  \item \textbf{Data.} \code{images}: 40{,}562 documents, one per MRI slice of the original
+        T1, T2 and PD series (series type \emph{PRIMARY}), with DICOM metadata and a 512-dimensional embedding
+        (average document size 7.4~KB). \code{patients}: 575 documents with the radiologist notes and
+        the arrays \code{levels} and \code{findings} extracted from them. To test growth, the
+        metadata of \code{images} (without embeddings) was copied ten times into a collection
+        \code{images\_big} of 405{,}620 documents; each copy receives new \code{patient\_id} values,
+        so every patient still has the same number of images.
+  \item \textbf{Method.} Each experiment drops the secondary indexes it studies and creates them
+        again; \code{hint()} forces a given index when several are present. For every query we record the
+        counters \code{totalKeysExamined}, \code{totalDocsExamined} and \code{nReturned} of the
+        \code{explain} output (\code{executionStats} mode), and the median client time of six runs
+        after one warm-up.
+        Times at the millisecond scale vary between runs, so the counters are the main evidence and
+        the times are indicative. The scripts (\code{scripts/demo\_indexing.py}) and the raw results
+        are in the project repository.
+\end{itemize}
 
 \subsection{Demo and results}
 \label{sec:index-demo}
 
-\subsubsection{Case 1: retrieve by patient ID}
-\todo{COLLSCAN vs IXSCAN, explain() metrics.}
+\subsubsection{Case study C1: retrieve by patient ID}
+\label{sec:idx-c1}
+C1 reads the notes from \code{patients} by \code{\_id} and the images of the patient from
+\code{images} by \code{patient\_id}. Patient \code{0001} has 54 images.
 
-\begin{lstlisting}[language=mongosh,caption={Example: create an index and inspect the plan}]
-db.images.createIndex({ patient_id: 1 })
-db.images.find({ patient_id: "P001" }).explain("executionStats")
+\begin{lstlisting}[language=mongosh,caption={C1: the images of one patient, before and after creating an index}]
+const q = { patient_id: "0001" }
+db.images.find(q).explain("executionStats")   // COLLSCAN
+db.images.createIndex({ patient_id: 1 })      // index pid_1
+db.images.find(q).explain("executionStats")   // IXSCAN -> FETCH
 \end{lstlisting}
 
-\subsubsection{Case 2: patient ID with conditions}
-\todo{Compound index, ESR rule, index prefix, covered query.}
-
-\subsubsection{Case 3: similar MRI images}
-\todo{Embeddings, vector search index, ANN vs exact.}
-
-\subsection{Theory vs. practice}
-\label{sec:index-compare}
-\begin{table}[H]
+\begin{figure}[H]
 \centering
-\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\includegraphics[width=\textwidth]{idx-scale}
+\caption{C1 without and with the index \code{pid\_1}, on the original collection and on the
+ten-times larger copy. (a) Entries read: documents for \code{COLLSCAN}; index keys plus documents
+(54\,+\,54) for the index plan. (b) Median client time.}
+\label{fig:idx-scale}
+\end{figure}
+
+Without an index the only access path is a \code{COLLSCAN} that reads every document to return 54
+(\Cref{fig:idx-scale}). With \code{pid\_1}, the plan reads 54 index keys and fetches 54 documents,
+and this number does not change when the collection grows from 40{,}562 to 405{,}620 documents. The
+scan time grows with the collection (26.6~ms to 151.1~ms), whereas the indexed query stays between
+1.2 and 3.5~ms. This is the difference between a linear search ($\approx b$ block accesses) and an index
+search ($t$ levels plus the matching records) of \Cref{sec:index-examples}. Reading the notes is an
+equality lookup on \code{patients.\_id}; measured on \code{images.\_id}, such a lookup is served by
+the MongoDB~8.0 fast path \code{EXPRESS\_IXSCAN} with one key and one document.
+
+\subsubsection{Case study C2: patient ID and conditions}
+\label{sec:idx-c2}
+C2 adds conditions on the image (for example T2 sagittal) and returns the slices in series and
+slice order:
+\begin{lstlisting}[language=mongosh,caption={C2 query (15 results for patient 0001)}]
+db.images.find({ patient_id: "0001", sequence: "T2", plane: "SAGITTAL" })
+         .sort({ series_folder: 1, instance_number: 1 })
+\end{lstlisting}
+\Cref{tab:idx-c2} runs this query and two variants against six candidate indexes.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{3.2cm}rrr@{}}
 \toprule
-\textbf{Class (Chapter 2)} & \textbf{MongoDB} \\
+ & \textbf{Index (forced with \code{hint})} & \textbf{Plan} & \textbf{Keys} & \textbf{Docs} & \textbf{Ret.} \\
 \midrule
-\todo{fill in} & \todo{fill in} \\
+\multicolumn{6}{@{}l}{\emph{(A) C2 query}} \\
+a & none & \code{COLLSCAN}, \code{SORT} & 0 & 40{,}562 & 15 \\
+b & \code{\{patient\_id\}} & \code{IXSCAN}, \code{FETCH}, \code{SORT} & 54 & 54 & 15 \\
+c & \code{\{patient\_id, sequence, plane\}} & \code{IXSCAN}, \code{FETCH}, \code{SORT} & 15 & 15 & 15 \\
+d & \code{\{patient\_id, sequence, plane, series\_folder, instance\_number\}} & \code{IXSCAN}, \code{FETCH} & 15 & 15 & 15 \\
+e & \code{\{plane, sequence, patient\_id\}} & \code{IXSCAN}, \code{FETCH}, \code{SORT} & 15 & 15 & 15 \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{(B) Only \code{patient\_id = "0001"}}} \\
+f & \code{\{patient\_id, sequence, plane\}} (prefix) & \code{IXSCAN}, \code{FETCH} & 54 & 54 & 54 \\
+g & \code{\{plane, sequence, patient\_id\}} (not a prefix) & \code{IXSCAN}, \code{FETCH} & 40{,}562 & 40{,}562 & 54 \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{(C) \code{sequence = "T2"} and \code{"0100"} $\le$ \code{patient\_id} $<$ \code{"0150"}}} \\
+h & \code{\{patient\_id, sequence\}} (range field first) & \code{IXSCAN}, \code{FETCH} & 1{,}630 & 1{,}586 & 1{,}586 \\
+i & \code{\{sequence, patient\_id\}} (equality field first) & \code{IXSCAN}, \code{FETCH} & 1{,}586 & 1{,}586 & 1{,}586 \\
+\midrule
+j & no hint: the planner chooses (d) and rejects 5 plans & \code{IXSCAN}, \code{FETCH} & 15 & 15 & 15 \\
 \bottomrule
 \end{tabularx}
-\caption{Comparison between theory and practice.}
+\caption{Compound indexes for C2 on \code{images} (40{,}562 documents). Keys = \code{totalKeysExamined},
+Docs = \code{totalDocsExamined}, Ret. = documents returned.}
+\label{tab:idx-c2}
 \end{table}
+
+The results show four properties of a compound index, whose entries are sorted on the first field,
+then the second, and so on:
+\begin{enumerate}
+  \item \textbf{More fields, tighter bounds.} The single-field index reads all 54 images of the
+        patient and filters them after \code{FETCH} (b); the three-field index reads exactly the 15
+        matches (c).
+  \item \textbf{Order of the equality fields does not matter} (c and e read the same 15 keys),
+        because equality on all fields selects one contiguous key range whatever the order
+        \cite{mongodb-esr}.
+  \item \textbf{Prefix rule.} An index can bound a query only on a \emph{prefix} of its fields
+        \cite{mongodb-compound}. With \code{patient\_id} first, a query on \code{patient\_id} alone
+        reads 54 keys (f). With \code{patient\_id} last, the bounds cover the whole index: the forced
+        plan reads all 40{,}562 keys and fetches all 40{,}562 documents (g), which is worse than a
+        collection scan; without the hint the planner would not choose it.
+  \item \textbf{Sort and range (ESR guideline).} Appending the sort fields after the equality fields
+        lets the index deliver the order, so the \code{SORT} stage disappears (d); the planner picks
+        this index among six candidates (j). In (C), putting the range field first costs 44 extra keys
+        and 44 \code{seeks}: the scan meets one out-of-range key at each patient boundary and seeks to
+        the next range \cite{mongodb-explain}. The textbook model would read every entry of the
+        range; the index scan instead jumps over the non-matching keys, so the extra cost is one key
+        per distinct \code{patient\_id} in the range, not one per non-matching entry.
+\end{enumerate}
+
+\paragraph{Covered query.} With the index of (d) and a projection that returns only the five
+indexed fields (and excludes \code{\_id}), the plan becomes \code{IXSCAN} $\rightarrow$ \code{PROJECTION\_COVERED} with 15 keys and \textbf{0}
+documents read; adding \code{file\_id}, which is not in the index, brings back a \code{FETCH} of 15
+documents. A covered query is answered by the index alone \cite{mongodb-covered}.
+
+\paragraph{Conditions on the notes (multikey index).} C2 may also filter patients by a finding,
+for example \code{\{findings: "annular\_tear"\}}. Without an index this is a \code{COLLSCAN} of the
+575 patients; with the multikey index \code{\{findings:1\}} the plan reads 29 keys and returns the 29
+patients. For \code{\{findings: \{\$all: ["disc\_bulge", "annular\_tear"]\}\}} the index bounds one
+value (29 keys) and \code{FETCH} filters the other, returning 26. The index holds 1{,}689 entries
+for 575 documents: one per array element (1{,}568) plus one for each of the 121 empty arrays.
+Like a secondary index on a non-key field, a multikey index has more entries than records.
+
+\paragraph{Index chosen for the application.} The index of (d),
+\code{\{patient\_id, sequence, plane, series\_folder, instance\_number\}}, serves C2 and, through its
+prefix \code{patient\_id}, also C1, so a separate \code{\{patient\_id\}} index is redundant
+\cite{mongodb-compound}. Together with \code{\{findings:1\}}, a text index on \code{notes} and the
+vector index of C3, it is the index set kept in the final database.
+
+\subsubsection{Case study C3: similar MRI images}
+\label{sec:idx-c3}
+Each image is converted into a 512-dimensional vector by a ResNet-18 network pre-trained on
+ImageNet \cite{he2016resnet}, normalized, and stored in \code{images.embedding}. A vector index on
+this field (cosine similarity, with \code{sequence}, \code{plane}, \code{patient\_id} and
+\code{series\_type} as filter fields) is built by \code{mongot}. A \code{\$vectorSearch} stage then
+returns the slices closest to the middle T2 sagittal slice of a given patient, restricted to T2
+sagittal slices of other patients. MongoDB answers approximate nearest-neighbor (ANN) queries with the
+Hierarchical Navigable Small World (HNSW) graph \cite{mongodb-vector,malkov2020hnsw}, where
+\code{numCandidates} sets how many candidates are explored, and exact (ENN) queries by comparing the
+query with every indexed vector that passes the filter.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{idx-vector}
+\caption{C3, top-10 neighbors of the middle T2 sagittal slice of patient \code{0001}. Recall@10 is
+the fraction of the exact top-10 also returned by ANN. ``With filter'' searches the 9{,}573 T2
+sagittal slices of the other patients; ``no filter'' searches all 40{,}562 slices.}
+\label{fig:idx-vector}
+\end{figure}
+
+With 50 or more candidates, ANN returns exactly the same top-10 as the exact search; with 10 or 20
+candidates it misses one or two of them (\Cref{fig:idx-vector}). ANN takes 3--10~ms, exact search
+10.3~ms over all slices and 18.2~ms with the filter, and the ANN latency generally rises with
+\code{numCandidates}. Unlike a B$^+$-tree, which always returns exact answers, the vector index
+trades accuracy for speed through a tunable parameter. At our scale (at most 40{,}562 vectors) the
+exact search is still affordable, so the gain of ANN is moderate.
+
+\subsubsection{Index structure and cost}
+\label{sec:idx-internals}
+\paragraph{Depth of the B-tree.} \Cref{tab:idx-depth} compares the multilevel-index estimate of
+\Cref{sec:multilevel} with the depth reported by WiredTiger. The estimate takes the on-disk index
+size divided by the number of entries as the entry size, 16~KB pages and 8-byte child pointers.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+\textbf{Collection} & \textbf{Index} & \textbf{Entries} & \textbf{Size} & \textbf{B/entry} & \textbf{Leaves$^*$} & \textbf{Fan-out$^*$} & \textbf{Depth} \\
+\midrule
+\code{images} & \code{\_id\_} & 40{,}562 & 5.00 MB & 123.2 & 308 & 124 & 3 \\
+ & \code{pid\_1} & 40{,}562 & 0.35 MB & 8.7 & 22 & 981 & 3 \\
+\code{images\_big} & \code{\_id\_} & 405{,}620 & 15.28 MB & 37.7 & 935 & 358 & 3 \\
+ & \code{pid\_1} & 405{,}620 & 4.25 MB & 10.5 & 260 & 886 & 3 \\
+\bottomrule
+\end{tabular}
+\caption{Index size and B-tree depth. $^*$Leaf pages and fan-out estimated with full 16~KB pages;
+Depth is the WiredTiger statistic \emph{maximum tree depth}.}
+\label{tab:idx-depth}
+\end{table}
+
+Because keys are prefix-compressed and pages are 16~KB, the estimated fan-out of \code{pid\_1} is
+close to 900, against 273 in the example of \Cref{sec:multilevel}. Ten times more entries give about
+twelve times more leaf pages (22 to 260), but the depth stays at 3 for every index, so a lookup still touches about
+three index pages plus the document: the $t + 1$ cost of a multilevel index, with $t$ growing as
+$\log_{fo} r$. The estimate gives two levels where WiredTiger reports three, because it assumes full
+pages and the compressed on-disk entry size; since the counting convention of the WiredTiger
+statistic is not documented, we compare the growth of the depth rather than its absolute value.
+
+\paragraph{Cost of indexes.} We inserted image metadata documents into an empty collection with 0,
+1, 3, 5 and 8 secondary indexes, both from the client (\code{insert\_many}, 100{,}000 documents)
+and inside the server (\code{\$merge}, 81{,}124 documents), and took the median of three runs
+(\Cref{fig:idx-cost}).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{idx-cost}
+\caption{Cost of maintaining indexes during bulk inserts. (a) Throughput relative to no secondary
+index. (b) Total index size after the 81{,}124 server-side inserts, including the default \code{\_id}
+index.}
+\label{fig:idx-cost}
+\end{figure}
+
+The space cost grows steadily: 2.2~MB with only \code{\_id} to 22.2~MB with eight secondary indexes,
+i.e.\ from 3\% to 34\% of the data size. With eight indexes the insert throughput falls to 62\%
+(server) and 58\% (client) of the baseline, because every insert must add one entry to each index;
+every server-side run with eight indexes (4.8--6.0~s) was slower than every run without one
+(3.5--3.8~s). With one to three indexes the differences are smaller than the variation between
+repetitions, so at this scale the write cost becomes clear only with several indexes. This confirms
+the guideline in class: indexes speed up reads but are paid for with space and slower writes.
+
+\subsubsection{Other index types}
+\label{sec:idx-other}
+\Cref{tab:idx-other} summarizes the remaining experiments.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{3.3cm}rrr>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Query} & \textbf{Plan} & \textbf{Keys} & \textbf{Docs} & \textbf{Ret.} & \textbf{Observation} \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Clustered collection (copy of \code{images}) vs.\ ordinary collection, query on \code{\_id}}} \\
+range of 2{,}000 \code{\_id} (ordinary) & \code{IXSCAN}, \code{FETCH} & 2{,}000 & 2{,}000 & 2{,}000 & index, then documents \\
+same range (clustered) & \code{CLUSTERED\_IXSCAN} & 0 & 2{,}001 & 2{,}000 & bounded scan of the data itself; no \code{\_id} index exists \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Sparse index on \code{patients.image\_count} (present in 515 of 575 documents)}} \\
+\code{image\_count} $\ge$ 100 & \code{IXSCAN}, \code{FETCH} & 77 & 77 & 77 & sparse index has 515 entries, normal index 575 \\
+\code{image\_count: null} & \code{COLLSCAN} & 0 & 575 & 60 & sparse index not usable \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Partial index on \code{images.patient\_age}, filter \code{patient\_age} $\ge$ 60 (5{,}003 entries)}} \\
+\code{patient\_age} $\ge$ 70 & \code{IXSCAN}, \code{FETCH} & 3{,}070 & 3{,}070 & 3{,}070 & query implies the filter \\
+\code{patient\_age} $\ge$ 50 & \code{COLLSCAN} & 0 & 40{,}562 & 12{,}120 & partial index not usable \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Text search in \code{patients.notes}}} \\
+\code{/annular/i}, no index & \code{COLLSCAN} & 0 & 575 & 32 & \\
+\code{/\textasciicircum LSS MRI/}, B-tree on \code{notes} & \code{IXSCAN}, \code{FETCH} & 305 & 304 & 304 & prefix gives the range \code{["LSS MRI", "LSS MRJ")} \\
+\code{/annular/i}, B-tree on \code{notes} & \code{IXSCAN}, \code{FETCH} & 515 & 32 & 32 & no bounds: all string keys read \\
+\code{\$text: "annular"}, text index & \code{IXSCAN}, \code{FETCH}, \code{TEXT\_MATCH} & 32 & 32 & 32 & inverted index on words \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Hashed index vs.\ B-tree on \code{images.patient\_id}}} \\
+equality \code{"0001"}, hashed & \code{IXSCAN}, \code{FETCH} & 54 & 54 & 54 & bounds on the 64-bit hash value \\
+range \code{"0001"}--\code{"0005"}, B-tree & \code{IXSCAN}, \code{FETCH} & 293 & 293 & 293 & \\
+same range, only hashed index & \code{COLLSCAN} & 0 & 40{,}562 & 293 & hash order is not key order \\
+\bottomrule
+\end{tabularx}
+\caption{Clustered, sparse, partial, text and hashed indexes.}
+\label{tab:idx-other}
+\end{table}
+
+In a clustered collection the documents themselves form the index: a range on \code{\_id} reads
+no index key, and no \code{\_id} index exists \cite{mongodb-clustered}. Sparse and partial indexes
+cover only part of the documents, so the planner refuses them whenever results could be lost
+\cite{mongodb-sparse,mongodb-partial}. The word \emph{sparse} has a different meaning from the one in
+class: the MongoDB documentation itself notes that its sparse indexes ``differ from block-level sparse
+indexes''; they skip documents without the field, whereas a non-dense index in class has one entry
+per block (or per distinct value) of an ordered file. A B-tree on a string supports only a regular
+expression anchored at the start, which becomes a key range; finding a word inside the notes needs the
+inverted text index. Finally, a hashed index serves equality as well as the B-tree but cannot serve a
+range, because hashing destroys the key order, exactly as for hash files in class.
+
+\subsection{Theory vs.\ practice}
+\label{sec:index-compare}
+\Cref{tab:index-compare} summarizes the comparison.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Aspect} & \textbf{Class (Chapter 2)} & \textbf{MongoDB 8.0 / WiredTiger (observed)} \\
+\midrule
+Index structure & B$^+$-tree: data pointers only in leaves, leaves linked in key order & B-tree whose leaves hold all key--value pairs; leaves are not linked, the next leaf is reached through the parent (copy-on-write pages) \\
+Node size and fan-out & One disk block (512~B--4~KB); fan-out 23--273 in the examples & 16~KB pages and prefix-compressed keys; estimated fan-out $\approx$ 900 for \code{pid\_1} \\
+Search cost & $t + 1$ block accesses, $t$ logarithmic in the entries & Depth 3 for 40{,}562 and for 405{,}620 entries; \code{IXSCAN} then \code{FETCH} by RecordId \\
+Primary / clustering index & Data file physically ordered; sparse index with one entry per block & Ordinary collections are not ordered by \code{\_id}, whose index is dense; a clustered collection stores documents in \code{\_id} order with no separate index; clustering on another field is not available \\
+Secondary index & Dense on a key field; non-key field: duplicate entries, pointer lists or an extra level & Indexes are dense unless declared sparse or partial; each entry is (key, RecordId), so duplicate values give duplicate entries (option~1), shortened by prefix compression; arrays give one entry per element (multikey) \\
+Dense vs.\ sparse & Sparse = entries for some values only (block anchors) & ``Sparse'' = skip documents without the field; ``partial'' = index documents matching a filter; the planner never uses them if results could be lost \\
+Multiple keys & Composite key ordered lexicographically & Compound index: prefix rule, equality fields in any order, sort fields before range fields (ESR); scans seek between key ranges \\
+Hashing & About one access for equality; no ordered access & Hashed index: equality only, a range falls back to \code{COLLSCAN} \\
+Other index types (Oracle) & Bitmap, function-based, application-domain & No bitmap index; text index (inverted, stemmed), vector index (HNSW, approximate, tunable accuracy) \\
+Cost of indexes & Faster reads, slower updates, extra storage & 8 indexes: index size 34\% of data, insert throughput about 60\% of the no-index case \\
+\bottomrule
+\end{tabularx}
+\caption{Indexing: theory in class versus MongoDB in practice.}
+\label{tab:index-compare}
+\end{table}
+
+In summary, MongoDB applies the ideas of Chapter~2 almost directly: its indexes are balanced trees
+whose cost grows logarithmically, compound indexes follow the order of their key fields, and every
+index is paid for in space and write time. The main differences come from engineering choices:
+large compressed pages, copy-on-write pages without leaf links, documents located through a
+RecordId instead of a block pointer, and index types for arrays, text and vectors that go beyond
+the B$^+$-tree.
